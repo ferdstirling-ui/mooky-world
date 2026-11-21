@@ -1,0 +1,1067 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Mooky Run</title>
+<meta name="description" content="Help Mooky run and jump as far as he can.">
+<style>
+  :root { --sky:#8FC5EA; --ink:#111; --shade:#C5DCFA; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; min-height:100%; background:var(--sky); color:var(--ink);
+    font-family: ui-rounded, "SF Pro Rounded", "Arial Rounded MT Bold", "Nunito", system-ui, sans-serif; }
+  body { display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:14px; padding:16px; min-height:100vh; -webkit-tap-highlight-color:transparent; }
+  .wrap { position:relative; width:min(100%, 960px); }
+  canvas { display:block; width:100%; height:auto; aspect-ratio:800 / 300; background:var(--sky);
+    border:4px solid var(--ink); border-radius:18px; touch-action:none; user-select:none; -webkit-user-select:none; cursor:pointer; }
+  .mute { position:absolute; top:10px; left:10px; width:40px; height:40px; border-radius:12px;
+    border:3px solid var(--ink); background:#fff; font-size:18px; line-height:1; cursor:pointer; padding:0; }
+  .mute:focus-visible { outline:3px solid #fff; outline-offset:2px; }
+  body { touch-action:manipulation; -webkit-user-select:none; user-select:none; }
+  /* Phones held upright: a taller game so Mooky is bigger */
+  @media (max-width:640px) and (orientation:portrait) {
+    canvas { aspect-ratio:480 / 300; }
+  }
+  /* Phones on their side: fit the game to the screen height */
+  @media (max-height:500px) and (orientation:landscape) {
+    body { padding:8px; gap:0; justify-content:center; }
+    .wrap { width:min(100%, calc((100vh - 16px) * 800 / 300)); width:min(100%, calc((100dvh - 16px) * 800 / 300)); }
+  }
+  body.embed { padding:0; gap:0; justify-content:flex-start; min-height:0; }
+  body.embed .wrap { width:100%; }
+  body.embed canvas { border:0; border-radius:0; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="game" width="800" height="300" aria-label="Mooky Run game. Press any key or click to jump."></canvas>
+    <button class="mute" id="mute" aria-label="Sound on or off">🔊</button>
+  </div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---------- setup ----------
+  const H = 300, GROUND = 252;
+  let W = 800, speedK = 1;   // W: how much of the world is visible; speedK slows the scroll on narrow screens
+  const INK = "#111", WHITE = "#fff", SHADE = "#C5DCFA";
+  const MS = 0.8;                       // Mooky's drawing scale
+  const GRAV = 2800, JUMP_V = 720;      // every jump is the same
+  const START_SPEED = 380, MAX_SPEED = 960, ACCEL = 10.8;   // speeds up 35% quicker than the old 8
+  const params = new URLSearchParams(location.search);
+  const DEBUG = params.has("debug");
+
+  let embedded = params.has("embed");
+  try { if (window.self !== window.top) embedded = true; } catch (e) { embedded = true; }
+  if (embedded) document.body.classList.add("embed");
+
+  const cv = document.getElementById("game");
+  const ctx = cv.getContext("2d");
+  const muteBtn = document.getElementById("mute");
+
+  function resize() {
+    const r = cv.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = Math.max(480, Math.min(1000, Math.round(H * r.width / Math.max(1, r.height))));
+    speedK = Math.max(0.68, Math.min(1, W / 800));
+    const w = Math.max(320, Math.round(r.width * dpr));
+    cv.width = w;
+    cv.height = Math.round(w * H / W);
+  }
+  new ResizeObserver(resize).observe(cv);
+  resize();
+
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  };
+
+  // ---------- sound ----------
+  let actx = null;
+  let muted = store.get("mookyRunMuted", "0") === "1";
+  function syncMute() { muteBtn.textContent = muted ? "🔇" : "🔊"; }
+  syncMute();
+  function tone(f1, f2, dur, type = "square", vol = 0.06, delay = 0) {
+    if (muted) return;
+    try {
+      if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+      if (actx.state === "suspended") actx.resume();
+      const t0 = actx.currentTime + delay;
+      const o = actx.createOscillator(), g = actx.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(f1, t0);
+      o.frequency.exponentialRampToValueAtTime(f2, t0 + dur);
+      g.gain.setValueAtTime(vol, t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g).connect(actx.destination);
+      o.start(t0); o.stop(t0 + dur + 0.02);
+    } catch (e) {}
+  }
+  const sfx = {
+    jump()  { tone(420, 820, 0.12, "sine", 0.12); },
+    point() { tone(880, 880, 0.07, "square", 0.04); tone(1320, 1320, 0.1, "square", 0.04, 0.08); },
+    hit()   { tone(260, 60, 0.35, "triangle", 0.2); },
+    roar()  { tone(150, 55, 0.7, "sawtooth", 0.09); tone(95, 45, 0.7, "square", 0.05); },
+    fire()  { tone(320, 70, 0.3, "sawtooth", 0.07); },
+    thump() { [0, 0.16, 0.32].forEach((d) => tone(120, 55, 0.13, "sine", 0.35, d)); },
+    toss()  { tone(520, 160, 0.18, "triangle", 0.08); },
+    pickup(){ [660, 880, 1320].forEach((f, i) => tone(f, f, 0.09, "square", 0.05, i * 0.07)); },
+    jet()   { tone(180, 900, 0.6, "sawtooth", 0.05); },
+    superGo(){ tone(220, 1100, 0.45, "square", 0.05); tone(440, 1760, 0.45, "sine", 0.06, 0.05); },
+    smash() { tone(200, 80, 0.14, "square", 0.08); },
+    powerDown() { tone(700, 250, 0.35, "sine", 0.07); }
+  };
+  muteBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    muted = !muted; store.set("mookyRunMuted", muted ? "1" : "0"); syncMute();
+    muteBtn.blur();
+  });
+
+  // ---------- state ----------
+  let state = "ready";          // ready | play | paused | over
+  let speed, dist, score, lastHundred, flashT, overAt, obstacles, clouds, scroll;
+  let hi = parseInt(store.get("mookyRunHi", "0"), 10) || 0;
+  let newHi = false;
+  let boss = null, bossCooldown = 12;   // the T-Rex or gorilla (null when neither is on screen)
+  const m = { x: 92, y: 0, vy: 0, ground: true, phase: 0, blinkT: 2,
+              power: null, falling: false, grace: 0 };   // power: the jetpack or super run, while it lasts
+
+  // ---------- power-ups ----------
+  // Each game rolls the dice at the start, then again every AGAIN_EVERY seconds, so one game can
+  // have several jetpacks and super runs. First roll: jetpack 55% of games (6-22 s in), super run
+  // 13% (8-28 s in); every later roll: jetpack 33%, super run 8%. Players who crash early miss some.
+  // Tested with a casual-player bot: the jetpack gets picked up in about 2 games in 5 (1 in 6 get two
+  // or more), the super run about 1 in 7. A 3-minute run sees about 3 jetpacks and 1 super run.
+  const JET_CHANCE = 0.55, SUPER_CHANCE = 0.13, JET_EXTRA = 0.33, SUPER_EXTRA = 0.08;
+  const AGAIN_FROM = 28, AGAIN_EVERY = 18;
+  const JET_FROM = 6, JET_TO = 22, SUPER_FROM = 8, SUPER_TO = 28;
+  // Short and very fast: each lasts only a moment but carries you a long way.
+  // The jetpack carries you much further (about twice as far) than the super run.
+  const JET_DUR = 2.0, SUPER_DUR = 1.25, JET_ALT = 150, JET_BOOST = 7.4, SUPER_BOOST = 5.4;
+  let pickups = [], plan = [], playTime = 0, nextRoll = 60, boost = 1, skyPuffs = [], bursts = [], camY = 0;
+  function planPowerups() {
+    plan = [];
+    if (Math.random() < JET_CHANCE) plan.push({ kind: "jet", at: JET_FROM + Math.random() * (JET_TO - JET_FROM) });
+    if (Math.random() < SUPER_CHANCE) plan.push({ kind: "super", at: SUPER_FROM + Math.random() * (SUPER_TO - SUPER_FROM) });
+    nextRoll = AGAIN_FROM;
+  }
+
+  function reset() {
+    speed = START_SPEED; dist = 0; score = 0; lastHundred = 0; flashT = 0; scroll = 0;
+    obstacles = []; newHi = false; boss = null; bossCooldown = 12;
+    m.y = 0; m.vy = 0; m.ground = true; m.power = null; m.falling = false; m.grace = 0;
+    pickups = []; skyPuffs = []; bursts = []; camY = 0; playTime = 0; boost = 1; planPowerups();
+    clouds = [];
+    for (let i = 0; i < 4; i++) clouds.push(makeCloud(80 + i * 210 + Math.random() * 60));
+  }
+  function makeCloud(x) { return { x, y: 30 + Math.random() * 80, s: 0.7 + Math.random() * 0.6 }; }
+  reset();
+
+  function start() { reset(); state = "play"; }
+  function gameOver() {
+    state = "over"; overAt = performance.now(); sfx.hit();
+    if (score > hi) { hi = score; newHi = true; store.set("mookyRunHi", String(hi)); }
+  }
+
+  // ---------- input ----------
+  function jumpPress() {
+    if (state === "ready") { start(); }
+    else if (state === "paused") { state = "play"; return; }
+    else if (state === "over") {
+      if (performance.now() - overAt > 450) start();
+      return;
+    }
+    if (m.ground) {
+      m.vy = JUMP_V; m.ground = false; sfx.jump();
+    }
+  }
+
+  // Computer: any key or a click jumps. Phone: a tap anywhere jumps.
+  // Shortcuts (Cmd/Ctrl + key), Tab and the F-keys are left alone so the browser still works.
+  const ignoredKey = (e) => e.metaKey || e.ctrlKey || e.altKey || e.key === "Tab" ||
+    /^F\d+$/.test(e.key) || ["Shift", "Control", "Alt", "Meta", "CapsLock"].includes(e.key);
+  window.addEventListener("keydown", (e) => {
+    if (ignoredKey(e)) return;
+    e.preventDefault();
+    if (!e.repeat) jumpPress();
+  });
+
+  const isTouch = window.matchMedia("(pointer: coarse)").matches || "ontouchstart" in window;
+  if (isTouch) cv.setAttribute("aria-label", "Mooky Run game. Tap to jump.");
+  const TAP = isTouch ? "Tap" : "Press any key";
+
+  document.addEventListener("pointerdown", (e) => {
+    if (e.target === muteBtn) return;
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    e.preventDefault();
+    jumpPress();
+  });
+  if (isTouch) document.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
+  cv.addEventListener("contextmenu", (e) => e.preventDefault());
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && state === "play") state = "paused";
+  });
+
+  // ---------- obstacles ----------
+  function spawn() {
+    const r = Math.random();
+    const x = W + 20;
+    if (score > 180 && r < 0.28) {
+      const heights = [14, 78];   // low: jump over it. high: stay on the ground
+      const lift = heights[Math.floor(Math.random() * heights.length)];
+      obstacles.push({ type: "bee", x, lift, w: 38, h: 26, flap: Math.random() * 6 });
+    } else if (r < 0.62) {
+      const n = score > 120 && Math.random() < 0.4 ? (Math.random() < 0.5 ? 2 : 3) : 1;
+      let bigUsed = false;   // at most one big rock per group, so a group is never too wide to jump
+      for (let i = 0; i < n; i++) {
+        const big = !bigUsed && Math.random() < 0.35;
+        if (big && n > 1) bigUsed = true;
+        const w = big ? 44 : 30 + Math.random() * 6, h = big ? 40 : 24 + Math.random() * 6;
+        obstacles.push({ type: "rock", x: x + i * (w - 6), w, h, seed: Math.random() });
+      }
+    } else {
+      const w = 28, h = 38 + Math.random() * 10;
+      obstacles.push({ type: "stump", x, w, h });
+    }
+  }
+  function gapFor() {
+    const v = speed * speedK;
+    const minGap = v * 0.5 + 150;
+    return minGap + Math.random() * (v * 0.85);
+  }
+  let nextGap = 0;
+
+  // ---------- bosses: the fire-breathing T-Rex and the giant gorilla ----------
+  // Every so often one of them runs in on the right and attacks a random 3 to 10 times.
+  // Before each attack there's a warning: the T-Rex opens his jaws, the gorilla winds up his arm.
+  // Mooky jumps every fireball and banana. Then the boss runs off again.
+  const REX_S = 0.95, GOR_S = 1.05, FIRE_EXTRA = 170, BANANA_EXTRA = 130;
+  const MIN_ATTACKS = 3, MAX_ATTACKS = 10;
+  const GOR_SHOULDER = [-14, -90], GOR_ARM = 70;
+  function newBoss(kind) {
+    boss = { kind, x: W + 150, phase: "enter", t: 0,
+             shots: MIN_ATTACKS + Math.floor(Math.random() * (MAX_ATTACKS - MIN_ATTACKS + 1)),
+             nextShot: 0.6 + Math.random() * 0.8, jaw: 0, flame: 0, arm: 0.25, legPhase: 0 };
+    kind === "rex" ? sfx.roar() : sfx.thump();
+  }
+  function updateBoss(dt) {
+    if (!boss) {
+      bossCooldown -= dt;
+      const clearRight = obstacles.every((o) => o.x < W * 0.55);
+      const free = !m.power && !m.falling && pickups.length === 0;
+      if (bossCooldown <= 0 && score > 100 && clearRight && free) newBoss(Math.random() < 0.5 ? "rex" : "gorilla");
+      return;
+    }
+    const b = boss, ease = (k) => Math.min(1, dt * k);
+    b.t += dt; b.legPhase += dt * (b.kind === "rex" ? 13 : 10);
+    b.flame = Math.max(0, b.flame - dt);
+    const home = W - (b.kind === "rex" ? 92 : 100);
+    if (b.phase === "enter") {
+      b.x += (home - b.x) * ease(5);
+      if (b.x - home < 2) { b.x = home; b.phase = "attack"; }
+    } else if (b.phase === "attack") {
+      b.nextShot -= dt;
+      const warning = b.nextShot < 0.4;
+      if (b.kind === "rex") b.jaw += ((warning ? 0.6 : 0) - b.jaw) * ease(14);
+      else b.arm += ((warning ? 2.5 : 0.25) - b.arm) * ease(12);
+      if (b.nextShot <= 0) {
+        b.kind === "rex" ? shootFire() : throwBanana();
+        b.shots--;
+        if (b.shots > 0) b.nextShot = attackGap();
+        else { b.phase = "done"; b.t = 0; }
+      }
+    } else if (b.phase === "done") {
+      b.jaw += (0 - b.jaw) * ease(10);
+      b.arm += (0.25 - b.arm) * ease(10);
+      if (b.t > 0.7) b.phase = "leave";
+    } else if (b.phase === "leave") {
+      b.x += 320 * dt;
+      if (b.x > W + 160) {
+        boss = null;
+        bossCooldown = 9 + Math.random() * 10;
+        nextGap = Math.min(nextGap, 120);
+      }
+    }
+  }
+  // Time until the next attack: sometimes quick-fire, usually normal, sometimes a long pause.
+  function attackGap() {
+    const r = Math.random();
+    if (r < 0.3) return 0.75 + Math.random() * 0.2;
+    if (r < 0.8) return 1.0 + Math.random() * 0.7;
+    return 1.8 + Math.random() * 1.0;
+  }
+  function shootFire() {
+    const mouthX = boss.x - 70 * REX_S, mouthLift = 86 * REX_S;
+    obstacles.push({ type: "fire", x: mouthX - 28, lift: mouthLift, target: 4 + Math.random() * 12,
+                     w: 28, h: 22, spin: Math.random() * 6 });
+    boss.flame = 0.3;
+    sfx.fire();
+  }
+  function throwBanana() {
+    boss.arm = -1.3;                                   // the arm snaps forward
+    const hx = boss.x + (GOR_SHOULDER[0] + Math.sin(-1.3) * GOR_ARM) * GOR_S;
+    const hLift = -(GOR_SHOULDER[1] + Math.cos(-1.3) * GOR_ARM) * GOR_S;
+    // Make sure it lands low well before it reaches Mooky, even on narrow phone screens at top speed
+    // (there the gorilla stands close, so he throws flatter).
+    const target = 4 + Math.random() * 12;
+    const reach = Math.max(0.15, (hx - 16 - (m.x + 40)) / ((speed + BANANA_EXTRA) * speedK));
+    const tl = reach * 0.6;
+    const vl = Math.min(170, (target - hLift + 750 * tl * tl) / tl);
+    obstacles.push({ type: "banana", x: hx - 16, lift: hLift, vl, target,
+                     w: 40, h: 24, spin: Math.random() * 6 });
+    sfx.toss();
+  }
+
+  // ---------- hitboxes ----------
+  function mookyBoxes() {
+    const sx = MS, sy = MS;
+    const fx = m.x, fy = GROUND - m.y;
+    const box = (x1, y1, x2, y2) => ({ x1: fx + x1 * sx, x2: fx + x2 * sx, y1: fy + y1 * sy, y2: fy + y2 * sy });
+    return [box(-11, -36, 11, -2), box(-19, -72, 23, -38)];
+  }
+  function obstacleBoxes(o) {
+    if (o.type === "fire" || o.type === "banana") {
+      const by = GROUND - o.lift;
+      return [{ x1: o.x + 4, x2: o.x + o.w - 4, y1: by - o.h + 4, y2: by - 2 }];
+    }
+    if (o.type === "bee") {
+      const by = GROUND - o.lift;
+      return [{ x1: o.x + 6, x2: o.x + o.w - 6, y1: by - o.h + 4, y2: by - 2 }];
+    }
+    return [{ x1: o.x + 5, x2: o.x + o.w - 5, y1: GROUND - o.h + 5, y2: GROUND }];
+  }
+  const overlap = (a, b) => a.x1 < b.x2 && a.x2 > b.x1 && a.y1 < b.y2 && a.y2 > b.y1;
+
+  // ---------- update ----------
+  function startPower(kind) {
+    m.power = { kind, t: 0, dur: kind === "jet" ? JET_DUR : SUPER_DUR };
+    sfx.pickup();
+    kind === "jet" ? sfx.jet() : sfx.superGo();
+  }
+  function endPower() {
+    const kind = m.power.kind;
+    m.power = null;
+    sfx.powerDown();
+    if (kind === "jet") { m.falling = true; m.vy = 0; m.ground = false; }   // out of fuel: drift back down
+    else m.grace = 1.0;                                                     // a moment to get ready
+    nextGap = Math.max(nextGap, speed * speedK * 0.9);                      // a clear stretch to land on
+  }
+  function smash(o) {
+    o.smashed = true; o.fly = 0; o.rot = 0;
+    o.vx = 250 + Math.random() * 300;   // knocked forwards across the screen, away from him
+    o.vy = 450 + Math.random() * 350;
+    bursts.push({ x: o.x + o.w / 2, y: GROUND - (o.lift || 0) - o.h / 2, t: 0 });
+    sfx.smash();
+  }
+
+  function update(dt) {
+    m.blinkT -= dt;
+    if (m.blinkT < -0.12) m.blinkT = 2 + Math.random() * 3;
+    if (state === "ready") { m.phase += dt * 3; return; }
+    if (state !== "play") return;
+    playTime += dt;
+
+    // speed (power-ups boost it, easing in and out)
+    const boostTarget = !m.power ? 1 : m.power.kind === "jet" ? JET_BOOST : SUPER_BOOST;
+    boost += (boostTarget - boost) * Math.min(1, dt * 6);
+    speed = Math.min(MAX_SPEED, speed + ACCEL * dt);
+    const v = speed * boost;
+    const dx = v * speedK * dt;
+    dist += v * dt; scroll += dx;
+    score = Math.floor(dist / 40);
+    if (Math.floor(score / 100) > lastHundred) { lastHundred = Math.floor(score / 100); flashT = 0.9; sfx.point(); }
+    if (flashT > 0) flashT -= dt;
+
+    // Mooky
+    if (m.power) m.power.t += dt;
+    if (m.power && m.power.kind === "jet") {
+      const target = JET_ALT + Math.sin(m.power.t * 3) * 6;
+      m.y += (target - m.y) * Math.min(1, dt * 6);
+      m.vy = 0; m.ground = false;
+      if (m.power.t >= m.power.dur) endPower();
+    } else {
+      m.vy -= GRAV * (m.falling ? 0.35 : 1) * dt; m.y += m.vy * dt;
+      if (m.y <= 0) {
+        if (m.falling) { m.falling = false; m.grace = 1.0; }
+        m.y = 0; m.vy = 0; m.ground = true;
+      }
+      if (m.power && m.power.t >= m.power.dur) endPower();
+    }
+    m.grace = Math.max(0, m.grace - dt);
+    m.phase += dt * (10 + Math.min(v, 1500) / 60);   // legs stop speeding up past a point, or they'd just flicker
+
+    // obstacles
+    for (const o of obstacles) {
+      if (o.smashed) {                                          // knocked flying by the super run
+        o.x += o.vx * dt; o.vy -= 1800 * dt; o.fly += o.vy * dt; o.rot += 9 * dt;
+        continue;
+      }
+      o.x -= dx + (o.type === "bee" ? 50 * dt : 0);
+      if (o.type === "fire") {
+        o.x -= FIRE_EXTRA * speedK * dt;                       // fireballs fly faster than the ground moves
+        o.lift += (o.target - o.lift) * Math.min(1, dt * 7);   // and drop low, so Mooky jumps them
+        o.spin += dt;
+      } else if (o.type === "banana") {
+        o.x -= BANANA_EXTRA * speedK * dt;                     // bananas are thrown in an arc
+        o.vl -= 1500 * dt; o.lift += o.vl * dt;                // and land low, spinning along
+        if (o.lift <= o.target) { o.lift = o.target; o.vl = 0; }
+        o.spin += dt;
+      }
+    }
+    obstacles = obstacles.filter((o) => o.x + o.w > -40 && !(o.smashed && (o.fly < -80 || o.x > W + 120)));
+    updateBoss(dt);
+    const flying = (m.power && m.power.kind === "jet") || m.falling;
+    if (!boss && !flying) {
+      nextGap -= dx;
+      if (nextGap <= 0) { spawn(); nextGap = gapFor(); }
+    }
+
+    // power-up pickups: place one when it's due and the way is clear
+    if (playTime >= nextRoll) {
+      nextRoll += AGAIN_EVERY;
+      if (Math.random() < JET_EXTRA) plan.push({ kind: "jet", at: playTime + Math.random() * 15 });
+      if (Math.random() < SUPER_EXTRA) plan.push({ kind: "super", at: playTime + Math.random() * 15 });
+    }
+    const due = plan.find((q) => playTime >= q.at);
+    if (due && !boss && !m.power && !m.falling && pickups.length === 0 && obstacles.every((o) => o.x < W - 170)) {
+      pickups.push({ kind: due.kind, x: W + 40, lift: 20 });
+      plan.splice(plan.indexOf(due), 1);
+      nextGap = Math.max(nextGap, 300);
+    }
+    for (const p of pickups) p.x -= dx;
+    pickups = pickups.filter((p) => p.x > -60);
+
+    // clouds (plus close-up clouds to fly through on the jetpack)
+    for (const c of clouds) c.x -= dx * 0.12;
+    clouds = clouds.filter((c) => c.x > -120);
+    if (clouds.length < 4) clouds.push(makeCloud(W + 60 + Math.random() * 120));
+    const jetOn = m.power && m.power.kind === "jet";
+    if (jetOn && m.power.t < m.power.dur - 0.3 && Math.random() < dt * 10) {
+      const back = Math.random() < 0.45, lvl = GROUND - JET_ALT - 40;   // his height up there
+      skyPuffs.push(back
+        ? { back, x: W + 80, y: lvl - 110 + Math.random() * 200, s: 1.1 + Math.random() * 0.8 }
+        : { back, x: W + 80, y: lvl - 45 + Math.random() * 90, s: 0.9 + Math.random() * 0.9 });
+    }
+    // the camera follows him up into the sky and back down
+    const camTarget = jetOn || m.falling ? Math.max(0, m.y - 40) * 0.75 : 0;
+    camY += (camTarget - camY) * Math.min(1, dt * (jetOn ? 4 : 8));
+    for (const b of bursts) { b.t += dt; b.x -= Math.min(dx, 12) * 0.5; }
+    bursts = bursts.filter((b) => b.t < 0.35);
+    // close-up clouds whoosh past (capped, so they're still visible at jetpack speed)
+    for (const c of skyPuffs) c.x -= Math.min(dx * 1.25, (c.back ? 1300 : 2200) * dt);
+    skyPuffs = skyPuffs.filter((c) => c.x > -160);
+
+    // collisions
+    const mb = mookyBoxes();
+    for (const p of pickups) {
+      const pb = { x1: p.x - 20, x2: p.x + 20, y1: GROUND - p.lift - 40, y2: GROUND - p.lift };
+      if (!m.power && !m.falling && mb.some((b) => overlap(b, pb))) { p.x = -999; startPower(p.kind); }
+    }
+    const superRun = m.power && m.power.kind === "super";
+    const safe = m.power || m.falling || m.grace > 0;
+    for (const o of obstacles) {
+      if (o.smashed) continue;
+      // at super-run speed things can skip past him between frames, so smash anything that reaches him
+      if (superRun && o.x < m.x + 18 && o.x + o.w > m.x - 60) { smash(o); continue; }
+      for (const ob of obstacleBoxes(o)) {
+        if (!mb.some((b) => overlap(b, ob))) continue;
+        if (superRun) { smash(o); break; }
+        if (!safe) { gameOver(); return; }
+      }
+    }
+  }
+
+  // ---------- drawing helpers ----------
+  function ell(cx, cy, rx, ry) { ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); }
+  function cap(p, r, col) {
+    ctx.strokeStyle = col; ctx.lineWidth = r * 2; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(p[2], p[3]); ctx.stroke();
+  }
+  function outlinedText(txt, x, y, size, fill = "#fff", align = "center") {
+    ctx.font = `800 ${size}px ui-rounded, "SF Pro Rounded", "Arial Rounded MT Bold", Nunito, system-ui, sans-serif`;
+    ctx.textAlign = align; ctx.textBaseline = "middle";
+    ctx.lineJoin = "round"; ctx.lineWidth = size * 0.22; ctx.strokeStyle = INK;
+    ctx.strokeText(txt, x, y); ctx.fillStyle = fill; ctx.fillText(txt, x, y);
+  }
+
+  // ---------- Mooky ----------
+  // a teardrop flame: round at (x, y), tip pointing in direction ang
+  function flameDrop(x, y, len, w, ang) {
+    const c = Math.cos(ang), sn = Math.sin(ang), nx = -sn * w, ny = c * w;
+    ctx.beginPath();
+    ctx.moveTo(x + nx, y + ny);
+    ctx.quadraticCurveTo(x + nx + c * len * 0.5, y + ny + sn * len * 0.5, x + c * len, y + sn * len);
+    ctx.quadraticCurveTo(x - nx + c * len * 0.5, y - ny + sn * len * 0.5, x - nx, y - ny);
+    ctx.arc(x, y, w, ang - Math.PI / 2, ang + Math.PI / 2, true);
+    ctx.closePath();
+  }
+  function drawMooky(x, feetY, mode, t = 0) {
+    ctx.save();
+    ctx.translate(x, feetY);
+    if (mode === "super") ctx.rotate(0.3);       // leaning hard into the run
+    if (mode === "jet") ctx.rotate(0.12);
+    const sx = MS, sy = MS;
+    ctx.scale(sx, sy);
+    const ph = m.phase;
+    let bob = 0, la = 0, lb = 0, aa = 0, ab = 0;
+    if (mode === "super") {
+      const s = Math.sin(ph);
+      bob = -Math.abs(Math.cos(ph)) * 2;
+      la = s * 0.95; lb = -s * 0.95; aa = -1.35; ab = -1.2;   // arms swept straight back
+    } else if (mode === "jet") {
+      la = -0.35; lb = -0.6; aa = 2.0; ab = 1.85;             // arms out in front, legs trailing
+      bob = Math.sin(t * 6) * 1.2;
+    } else if (mode === "run") {
+      const s = Math.sin(ph);
+      bob = -Math.abs(Math.cos(ph)) * 2.4;
+      la = s * 0.7; lb = -s * 0.7; aa = 0.3 - s * 0.35; ab = -0.3 + s * 0.35;
+    } else if (mode === "jump" || mode === "fall") {
+      la = 0.65; lb = -0.7; aa = 1.95; ab = -1.95;
+    } else if (mode === "dead") {
+      la = 0.25; lb = -0.25; aa = 1.75; ab = -1.75;
+    } else { // idle
+      bob = Math.sin(ph) * 1.2;
+      aa = 0.12; ab = -0.12;
+    }
+    const hipY = -15 + bob, LEG = 13, LR = 6.2;
+    const leg = (hx, a) => [hx, hipY, hx + Math.sin(a) * LEG, hipY + Math.cos(a) * LEG];
+    const backLeg = leg(-5, lb), frontLeg = leg(5, la);
+    const shY = -30 + bob, ARM = 12, AR = 5.2;
+    const arm = (sxp, a) => [sxp, shY, sxp + Math.sin(a) * ARM, shY + Math.cos(a) * ARM];
+    const backArm = arm(-13, ab), frontArm = arm(13, aa);
+    const by = -25 + bob, hy = -55 + bob, hx = 2;
+    const SR = 3.4;
+    const sprouts = [[hx + 1, hy - 18, hx - 6, hy - 28], [hx + 1, hy - 18, hx + 9, hy - 30]];
+    const O = 3.3;
+
+    // super run: blue fire all around him, streaming backwards
+    if (mode === "super") {
+      const spots = [[-18, -62], [-22, -48], [-8, -78], [8, -80], [22, -72], [-16, -30], [-18, -14], [28, -56], [10, -42], [-26, -64]];
+      ctx.fillStyle = "rgba(70,150,255,0.30)"; ell(-4, -45 + bob, 48, 58); ctx.fill();
+      spots.forEach(([fx, fy], i) => {
+        const len = 40 + Math.sin(t * 22 + i * 1.7) * 11, ang = -2.75 + Math.sin(t * 9 + i) * 0.18;
+        ctx.fillStyle = "rgba(30,100,255,0.75)"; flameDrop(fx, fy + bob, len, 13, ang); ctx.fill();
+        ctx.fillStyle = "rgba(150,215,255,0.9)"; flameDrop(fx + 2, fy + bob, len * 0.6, 7, ang); ctx.fill();
+      });
+    }
+    // jetpack on his back (still there, out of fuel, while he falls back down)
+    if (mode === "jet" || mode === "fall") {
+      const f = 1 + Math.sin(t * 45) * 0.25;
+      [[-40, -50], [-30, -47]].forEach(([tx, ty]) => {
+        if (mode === "jet") {
+          ctx.fillStyle = "#FF7A2B"; flameDrop(tx + 5, ty + 30 + bob, 28 * f, 5.5, Math.PI / 2 + 0.25); ctx.fill();
+          ctx.fillStyle = "#FFE066"; flameDrop(tx + 5, ty + 30 + bob, 15 * f, 3.2, Math.PI / 2 + 0.25); ctx.fill();
+        }
+        ctx.beginPath(); ctx.roundRect(tx, ty + bob, 10, 30, 5);
+        ctx.fillStyle = "#E5484D"; ctx.fill(); ctx.strokeStyle = INK; ctx.lineWidth = 3; ctx.stroke();
+        ctx.beginPath(); ctx.roundRect(tx + 1.5, ty - 3 + bob, 7, 6, 2);
+        ctx.fillStyle = "#B8C0CC"; ctx.fill(); ctx.lineWidth = 2; ctx.stroke();
+      });
+    }
+
+    // 1) one silhouette outline for the whole body (no lines where parts overlap)
+    ctx.fillStyle = INK;
+    [backLeg, frontLeg].forEach((p) => cap(p, LR + O, INK));
+    [backArm, frontArm].forEach((p) => cap(p, AR + O, INK));
+    sprouts.forEach((p) => cap(p, SR + O, INK));
+    ell(0, by, 15 + O, 14 + O); ctx.fill();
+    ell(hx, hy, 27 + O, 21 + O); ctx.fill();
+
+    // 2) white fills with the blue shadow on the lower right
+    const limb = (p, r) => { cap(p, r, SHADE); cap([p[0] - 1.6, p[1] - 0.6, p[2] - 1.6, p[3] - 0.6], r - 1.3, WHITE); };
+    limb(backLeg, LR); limb(frontLeg, LR); limb(backArm, AR);
+
+    ctx.save(); ell(0, by, 15, 14); ctx.clip();
+    ctx.fillStyle = SHADE; ctx.fillRect(-20, by - 20, 40, 40);
+    ctx.fillStyle = WHITE; ell(-4, by - 3, 15, 14); ctx.fill();
+    ctx.fillStyle = SHADE; ell(hx + 1, hy + 6, 26, 20); ctx.fill();   // head's shadow on the body
+    ctx.restore();
+
+    limb(frontArm, AR);
+    sprouts.forEach((p) => limb(p, SR));
+
+    ctx.save(); ell(hx, hy, 27, 21); ctx.clip();
+    ctx.fillStyle = SHADE; ctx.fillRect(hx - 30, hy - 25, 60, 50);
+    ctx.fillStyle = WHITE; ell(hx - 4.5, hy - 4, 27, 21); ctx.fill();
+    ctx.restore();
+
+    // 3) face (turned a little to the right, the way he runs)
+    ctx.fillStyle = INK; ctx.strokeStyle = INK; ctx.lineCap = "round";
+    const ex1 = hx + 1, ex2 = hx + 16, ey = hy - 1;
+    if (mode === "dead") {
+      ell(ex1, ey, 3.2, 4.8); ctx.fill(); ell(ex2, ey, 3.2, 4.8); ctx.fill();
+      ctx.fillStyle = WHITE; ell(ex1 + 1, ey - 1.8, 1, 1.2); ctx.fill(); ell(ex2 + 1, ey - 1.8, 1, 1.2); ctx.fill();
+      ctx.lineWidth = 1.8;
+      [ex1, ex2].forEach((x) => { ctx.beginPath(); ctx.moveTo(x - 3, ey - 10); ctx.quadraticCurveTo(x, ey - 13, x + 3, ey - 11); ctx.stroke(); });
+      ctx.fillStyle = INK; ell(hx + 9, hy + 9, 2.6, 3.4); ctx.fill();
+    } else {
+      if (m.blinkT < 0 && mode !== "jump") {
+        ctx.lineWidth = 1.8;
+        [ex1, ex2].forEach((x) => { ctx.beginPath(); ctx.moveTo(x - 2.5, ey); ctx.lineTo(x + 2.5, ey); ctx.stroke(); });
+      } else {
+        ell(ex1, ey, 2.4, 3.8); ctx.fill(); ell(ex2, ey, 2.4, 3.8); ctx.fill();
+      }
+      ctx.lineWidth = 1.6;
+      [ex1, ex2].forEach((x) => { ctx.beginPath(); ctx.moveTo(x - 3, ey - 7.5); ctx.quadraticCurveTo(x, ey - 10, x + 3, ey - 7.5); ctx.stroke(); });
+      ctx.lineWidth = 1.9;
+      ctx.beginPath();
+      if (mode === "jump") ctx.arc(hx + 9, hy + 4, 6, 0.1 * Math.PI, 0.9 * Math.PI);
+      else ctx.arc(hx + 9, hy + 3, 5.5, 0.2 * Math.PI, 0.8 * Math.PI);
+      ctx.stroke();
+    }
+    // super run: a few licks of blue fire in front of his back edge, so he looks wrapped in it
+    if (mode === "super") {
+      [[-24, -66], [-19, -42], [-15, -16]].forEach(([fx, fy], i) => {
+        const len = 22 + Math.sin(t * 25 + i * 2.3) * 7, ang = -2.8 + Math.sin(t * 11 + i) * 0.2;
+        ctx.fillStyle = "rgba(40,120,255,0.55)"; flameDrop(fx, fy + bob, len, 7, ang); ctx.fill();
+        ctx.fillStyle = "rgba(170,225,255,0.7)"; flameDrop(fx + 1, fy + bob, len * 0.55, 3.5, ang); ctx.fill();
+      });
+    }
+    ctx.restore();
+
+    // ground shadow
+    {
+      const k = Math.max(0.35, 1 - m.y / 160);
+      ctx.fillStyle = "rgba(20,60,40,0.18)";
+      ell(x + 1, GROUND + 3, 17 * k, 3.5 * k); ctx.fill();
+    }
+  }
+
+  // ---------- obstacles ----------
+  function rockPath(o) {
+    const x = o.x, y = GROUND, w = o.w, h = o.h, s = o.seed;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.bezierCurveTo(x - 3, y - h * 0.55, x + w * (0.1 + s * 0.1), y - h, x + w * (0.45 + s * 0.1), y - h);
+    ctx.bezierCurveTo(x + w * 0.85, y - h * (1.02 - s * 0.1), x + w + 3, y - h * 0.5, x + w, y);
+    ctx.closePath();
+  }
+  function drawRock(o) {
+    rockPath(o);
+    ctx.fillStyle = "#AEB9C6"; ctx.fill();
+    ctx.save(); rockPath(o); ctx.clip();
+    ctx.fillStyle = "#D3DAE3";
+    ctx.beginPath(); ctx.ellipse(o.x + o.w * 0.4, GROUND - o.h * 0.55, o.w * 0.48, o.h * 0.62, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    rockPath(o); ctx.strokeStyle = INK; ctx.lineWidth = 3.2; ctx.lineJoin = "round"; ctx.stroke();
+    ctx.lineWidth = 1.8; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(o.x + o.w * 0.55, GROUND - o.h * 0.35); ctx.lineTo(o.x + o.w * 0.68, GROUND - o.h * 0.22); ctx.stroke();
+  }
+  function drawStump(o) {
+    const x = o.x, w = o.w, top = GROUND - o.h;
+    ctx.fillStyle = "#B97E50";
+    ctx.fillRect(x, top, w, o.h);
+    ctx.fillStyle = "#97623B"; ctx.fillRect(x + w * 0.62, top, w * 0.38, o.h);
+    ctx.strokeStyle = INK; ctx.lineWidth = 3.2; ctx.lineJoin = "round";
+    ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, GROUND); ctx.moveTo(x + w, top); ctx.lineTo(x + w, GROUND); ctx.stroke();
+    ctx.lineWidth = 1.6; ctx.beginPath(); ctx.moveTo(x + w * 0.3, top + 12); ctx.lineTo(x + w * 0.3, top + 24); ctx.stroke();
+    ell(x + w / 2, top, w / 2, 6); ctx.fillStyle = "#EBC48F"; ctx.fill(); ctx.lineWidth = 3.2; ctx.stroke();
+    ctx.lineWidth = 1.4; ell(x + w / 2, top, w / 4, 3); ctx.stroke();
+  }
+  function drawBee(o, t) {
+    const cx = o.x + o.w / 2, cy = GROUND - o.lift - o.h / 2 + Math.sin(t * 6 + o.flap) * 2.5;
+    const flap = Math.sin(t * 40 + o.flap);
+    // wings
+    ctx.fillStyle = "rgba(255,255,255,0.9)"; ctx.strokeStyle = INK; ctx.lineWidth = 2.2;
+    ctx.save(); ctx.translate(cx + 2, cy - 9); ctx.rotate(-0.4 + flap * 0.5);
+    ell(0, -8, 6, 10); ctx.fill(); ctx.stroke(); ctx.restore();
+    // body
+    ell(cx, cy, 17, 12); ctx.fillStyle = "#FFD54A"; ctx.fill();
+    ctx.save(); ell(cx, cy, 17, 12); ctx.clip();
+    ctx.fillStyle = INK; ctx.fillRect(cx - 4, cy - 13, 5, 26); ctx.fillRect(cx + 5, cy - 13, 5, 26);
+    ctx.fillStyle = "#F2B526"; ell(cx + 3, cy + 8, 20, 6); ctx.fill();
+    ctx.restore();
+    ell(cx, cy, 17, 12); ctx.lineWidth = 3; ctx.stroke();
+    // stinger at the back (bees face left, towards Mooky)
+    ctx.fillStyle = INK; ctx.beginPath(); ctx.moveTo(cx + 16, cy - 3); ctx.lineTo(cx + 24, cy); ctx.lineTo(cx + 16, cy + 3); ctx.fill();
+    // face, looking left at Mooky
+    ell(cx - 9, cy - 2, 2, 3); ctx.fill();
+    ctx.lineWidth = 1.6; ctx.beginPath(); ctx.moveTo(cx - 14, cy - 8); ctx.lineTo(cx - 6, cy - 6); ctx.stroke();
+    ctx.fillStyle = "rgba(255,255,255,0.95)"; ctx.save(); ctx.translate(cx - 4, cy - 10); ctx.rotate(0.3 - flap * 0.5);
+    ell(0, -7, 5, 9); ctx.fill(); ctx.lineWidth = 2.2; ctx.stroke(); ctx.restore();
+  }
+
+  // ---------- T-Rex drawing (faces left, towards Mooky) ----------
+  function drawRex(r, t) {
+    const BODY = "#E8794A", DARK = "#C4572F", BELLY = "#F8CB93", O = 3.3;
+    ctx.save();
+    ctx.translate(r.x, GROUND); ctx.scale(REX_S, REX_S);
+    const s = Math.sin(r.legPhase);
+    const bob = -Math.abs(Math.cos(r.legPhase)) * 2.5;
+    const wag = Math.sin(t * 5) * 4;
+    const farLeg = [24, -42 + bob, 30 + s * 11, -5], nearLeg = [6, -42 + bob, 2 - s * 11, -5];
+    const arm = [-20, -68 + bob, -28, -60 + bob];
+    const spikes = [[-6, -98], [8, -92], [22, -86], [36, -80], [50, -75]];
+    const tail = () => { ctx.beginPath(); ctx.moveTo(28, -80 + bob); ctx.quadraticCurveTo(72, -78 + bob, 100, -52 + wag);
+      ctx.quadraticCurveTo(72, -54 + bob, 32, -44 + bob); ctx.closePath(); };
+    const body = () => { ctx.beginPath(); ctx.ellipse(12, -62 + bob, 36, 27, -0.25, 0, Math.PI * 2); };
+    const neck = () => { ctx.beginPath(); ctx.ellipse(-18, -84 + bob, 18, 20, 0.35, 0, Math.PI * 2); };
+    const head = () => { ctx.beginPath(); ctx.roundRect(-72, -118 + bob, 66, 28, 13); };
+    const spike = ([x, y]) => { ctx.beginPath(); ctx.moveTo(x - 6, y + 4 + bob); ctx.lineTo(x + 3, y - 9 + bob); ctx.lineTo(x + 7, y + 4 + bob); ctx.closePath(); };
+    const foot = (p) => { ctx.beginPath(); ctx.ellipse(p[2] - 5, p[3] + 1, 13, 5.5, 0, 0, Math.PI * 2); };
+
+    // lower jaw first, so the head's outline makes the mouth line
+    ctx.save(); ctx.translate(-16, -92 + bob); ctx.rotate(-r.jaw);
+    ctx.beginPath(); ctx.roundRect(-54, -3, 46, 13, 6);
+    ctx.fillStyle = BODY; ctx.fill(); ctx.strokeStyle = INK; ctx.lineWidth = O; ctx.stroke();
+    if (r.jaw > 0.12) {
+      ctx.fillStyle = "#fff";
+      for (let i = 0; i < 4; i++) { const x = -50 + i * 9; ctx.beginPath(); ctx.moveTo(x, -2); ctx.lineTo(x + 3, -8); ctx.lineTo(x + 6, -2); ctx.fill(); }
+    }
+    ctx.restore();
+
+    // one outline around the whole dinosaur
+    ctx.fillStyle = INK; ctx.strokeStyle = INK; ctx.lineJoin = "round";
+    ctx.lineWidth = O * 2;
+    [tail, body, neck, head].forEach((f) => { f(); ctx.fill(); ctx.stroke(); });
+    spikes.forEach((p) => { spike(p); ctx.fill(); ctx.stroke(); });
+    cap(farLeg, 10 + O, INK); cap(nearLeg, 10 + O, INK); cap(arm, 4 + O, INK);
+    foot(farLeg); ctx.lineWidth = O * 2; ctx.fill(); ctx.stroke();
+    foot(nearLeg); ctx.fill(); ctx.stroke();
+
+    // fills
+    ctx.fillStyle = DARK; spikes.forEach((p) => { spike(p); ctx.fill(); });
+    cap(farLeg, 10, DARK); ctx.fillStyle = DARK; foot(farLeg); ctx.fill();
+    ctx.fillStyle = BODY; tail(); ctx.fill();
+    ctx.save(); body(); ctx.clip();
+    ctx.fillStyle = DARK; ctx.fillRect(-30, -100, 90, 80);
+    ctx.fillStyle = BODY; ctx.beginPath(); ctx.ellipse(8, -66 + bob, 36, 27, -0.25, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = BELLY; ctx.beginPath(); ctx.ellipse(-8, -52 + bob, 18, 16, -0.4, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    cap(nearLeg, 10, BODY); ctx.fillStyle = BODY; foot(nearLeg); ctx.fill();
+    ctx.fillStyle = BODY; neck(); ctx.fill();
+    ctx.save(); head(); ctx.fillStyle = DARK; ctx.fill(); ctx.clip();
+    ctx.fillStyle = BODY; ctx.beginPath(); ctx.roundRect(-75, -122 + bob, 66, 28, 13); ctx.fill();
+    ctx.restore();
+    cap(arm, 4, BODY);
+
+    // face: angry eye, nostril, top teeth when the mouth is open
+    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.ellipse(-30, -105 + bob, 6, 6, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = INK; ctx.stroke();
+    ctx.fillStyle = INK; ctx.beginPath(); ctx.ellipse(-32, -104 + bob, 2.8, 3.4, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.lineWidth = 3.4; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(-41, -115 + bob); ctx.lineTo(-23, -109 + bob); ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(-64, -110 + bob, 1.6, 2.4, 0, 0, Math.PI * 2); ctx.fill();
+    if (r.jaw > 0.12) {
+      ctx.fillStyle = "#fff";
+      for (let i = 0; i < 4; i++) { const x = -66 + i * 9; ctx.beginPath(); ctx.moveTo(x, -91 + bob); ctx.lineTo(x + 3, -85 + bob); ctx.lineTo(x + 6, -91 + bob); ctx.fill(); }
+    }
+    // a burst of fire at the mouth as he breathes
+    if (r.flame > 0) {
+      const k = r.flame / 0.3;
+      ctx.translate(-74, -88 + bob);
+      ctx.fillStyle = "#FF6A2B"; ctx.beginPath(); ctx.ellipse(-14 * k, 0, 22 * k + 4, 11 * k + 3, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#FFB02E"; ctx.beginPath(); ctx.ellipse(-10 * k, 0, 14 * k + 3, 7 * k + 2, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#FFE680"; ctx.beginPath(); ctx.ellipse(-6 * k, 0, 7 * k + 2, 4 * k + 1, 0, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+  }
+  function drawFire(o, t) {
+    const cx = o.x + o.w / 2, cy = GROUND - o.lift - o.h / 2;
+    const fl = Math.sin(t * 30 + o.spin * 7);
+    // flame tail trailing behind (to the right)
+    ctx.fillStyle = "#FF6A2B";
+    ctx.beginPath(); ctx.moveTo(cx, cy - 11); ctx.quadraticCurveTo(cx + 26, cy - 10 + fl * 3, cx + 38 + fl * 4, cy - 2);
+    ctx.quadraticCurveTo(cx + 24, cy + 8 - fl * 2, cx, cy + 11); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = INK; ctx.lineWidth = 2.6; ctx.lineJoin = "round"; ctx.stroke();
+    ctx.fillStyle = "#FFB02E";
+    ctx.beginPath(); ctx.moveTo(cx, cy - 6); ctx.quadraticCurveTo(cx + 16, cy - 5, cx + 24 + fl * 3, cy);
+    ctx.quadraticCurveTo(cx + 14, cy + 5, cx, cy + 6); ctx.closePath(); ctx.fill();
+    // the ball
+    ell(cx, cy, 12, 11); ctx.fillStyle = "#FF6A2B"; ctx.fill(); ctx.lineWidth = 3; ctx.stroke();
+    ell(cx - 1, cy, 7.5, 7); ctx.fillStyle = "#FFB02E"; ctx.fill();
+    ell(cx - 2, cy - 1, 3.6, 3.4); ctx.fillStyle = "#FFF1A8"; ctx.fill();
+  }
+
+  // ---------- giant gorilla drawing (faces left, towards Mooky) ----------
+  function drawGorilla(b, t) {
+    const FUR = "#6E6579", DARK = "#4E4757", SKIN = "#B48C76", MUZZLE = "#D2AE96", O = 3.3;
+    ctx.save();
+    ctx.translate(b.x, GROUND); ctx.scale(GOR_S, GOR_S);
+    const s = Math.sin(b.legPhase);
+    const bob = -Math.abs(Math.cos(b.legPhase)) * 3;
+    const farArm = [26, -92 + bob, 38 + s * 7, -9];
+    const farLeg = [20, -36 + bob, 25 + s * 9, -9], nearLeg = [0, -36 + bob, -5 - s * 9, -9];
+    const sh = [GOR_SHOULDER[0], GOR_SHOULDER[1] + bob];
+    const a = b.arm;
+    const hand = [sh[0] + Math.sin(a) * GOR_ARM, sh[1] + Math.cos(a) * GOR_ARM];
+    const nearArm = [sh[0], sh[1], hand[0], hand[1]];
+    const body = () => { ctx.beginPath(); ctx.ellipse(8, -70 + bob, 40, 38, 0.2, 0, Math.PI * 2); };
+    const head = () => { ctx.beginPath(); ctx.ellipse(-28, -114 + bob, 24, 23, 0, 0, Math.PI * 2); };
+    const crest = () => { ctx.beginPath(); ctx.ellipse(-22, -132 + bob, 13, 9, 0.2, 0, Math.PI * 2); };
+    const fist = () => { ctx.beginPath(); ctx.ellipse(hand[0], hand[1], 13, 12, 0, 0, Math.PI * 2); };
+
+    // one outline around the whole gorilla
+    ctx.fillStyle = INK; ctx.strokeStyle = INK; ctx.lineWidth = O * 2; ctx.lineJoin = "round";
+    cap(farArm, 11 + O, INK); cap(farLeg, 11 + O, INK); cap(nearLeg, 11 + O, INK); cap(nearArm, 11.5 + O, INK);
+    ctx.fillStyle = INK; ctx.strokeStyle = INK; ctx.lineWidth = O * 2;   // cap() changes these, so set them again
+    [body, crest, head, fist].forEach((f) => { f(); ctx.fill(); ctx.stroke(); });
+
+    // fills (dark on the far side, a lighter edge on the near side)
+    cap(farArm, 11, DARK); cap(farLeg, 11, DARK);
+    ctx.save(); body(); ctx.clip();
+    ctx.fillStyle = DARK; ctx.fillRect(-40, -115, 100, 90);
+    ctx.fillStyle = FUR; ctx.beginPath(); ctx.ellipse(3, -75 + bob, 40, 38, 0.2, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#8A8195"; ctx.beginPath(); ctx.ellipse(-12, -70 + bob, 17, 21, 0.1, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    cap(nearLeg, 11, FUR);
+    ctx.fillStyle = FUR; crest(); ctx.fill();
+    ctx.save(); head(); ctx.clip();
+    ctx.fillStyle = DARK; ctx.fillRect(-55, -140, 55, 55);
+    ctx.fillStyle = FUR; ctx.beginPath(); ctx.ellipse(-32, -118 + bob, 24, 23, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+
+    // face: skin, muzzle, angry brow, eyes, nostrils, frown
+    ctx.fillStyle = SKIN; ctx.beginPath(); ctx.ellipse(-36, -110 + bob, 15, 14, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = MUZZLE; ctx.beginPath(); ctx.ellipse(-40, -100 + bob, 13, 9, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = INK; ctx.stroke();
+    ctx.fillStyle = INK;
+    [[-44, -112], [-31, -112]].forEach(([x, y]) => { ctx.beginPath(); ctx.ellipse(x, y + bob, 2.4, 2.8, 0, 0, Math.PI * 2); ctx.fill(); });
+    ctx.lineWidth = 4.5; ctx.lineCap = "round"; ctx.strokeStyle = DARK;
+    ctx.beginPath(); ctx.moveTo(-52, -122 + bob); ctx.lineTo(-38, -116 + bob); ctx.lineTo(-24, -122 + bob); ctx.stroke();
+    ctx.fillStyle = INK;
+    [[-45, -102], [-38, -102]].forEach(([x, y]) => { ctx.beginPath(); ctx.ellipse(x, y + bob, 1.8, 1.4, 0, 0, Math.PI * 2); ctx.fill(); });
+    ctx.lineWidth = 2; ctx.strokeStyle = INK;
+    ctx.beginPath(); ctx.moveTo(-47, -95 + bob); ctx.quadraticCurveTo(-41, -98 + bob, -34, -95 + bob); ctx.stroke();
+
+    // throwing arm, in front, with a banana in the fist while winding up
+    cap(nearArm, 11.5, DARK);
+    cap([nearArm[0] - 2, nearArm[1] - 1, nearArm[2] - 2, nearArm[3] - 1], 9.5, FUR);
+    ctx.fillStyle = DARK; fist(); ctx.fill();
+    if (b.arm > 1.0) {
+      ctx.save(); ctx.translate(hand[0], hand[1] - 10); ctx.rotate(-0.6); bananaShape(1.1); ctx.restore();
+    }
+    ctx.restore();
+  }
+  function bananaShape(k) {
+    ctx.save(); ctx.scale(k, k);
+    ctx.beginPath(); ctx.moveTo(-14, -5); ctx.quadraticCurveTo(0, 15, 14, -5); ctx.quadraticCurveTo(0, 4, -14, -5); ctx.closePath();
+    ctx.fillStyle = "#FFD84A"; ctx.fill();
+    ctx.strokeStyle = INK; ctx.lineWidth = 2.4; ctx.lineJoin = "round"; ctx.stroke();
+    ctx.fillStyle = "#6B4A2B";
+    ctx.beginPath(); ctx.ellipse(-14, -5, 2.2, 2.2, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(14, -5, 2.2, 2.2, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+  function drawBanana(o) {
+    ctx.save();
+    ctx.translate(o.x + o.w / 2, GROUND - o.lift - o.h / 2);
+    ctx.rotate(-o.spin * 12);
+    bananaShape(1.55);
+    ctx.restore();
+  }
+
+  // ---------- power-up pickups ----------
+  function drawPickup(p, t) {
+    const cx = p.x, cy = GROUND - p.lift - 20 + Math.sin(t * 4) * 4;
+    const pulse = 1 + Math.sin(t * 7) * 0.1;
+    ctx.fillStyle = p.kind === "super" ? "rgba(70,150,255,0.35)" : "rgba(255,190,60,0.4)";
+    ell(cx, cy, 28 * pulse, 28 * pulse); ctx.fill();
+    ell(cx, cy, 20, 20); ctx.fillStyle = "#fff"; ctx.fill();
+    ctx.strokeStyle = INK; ctx.lineWidth = 3; ctx.stroke();
+    if (p.kind === "jet") {
+      [[-10, -10], [1, -10]].forEach(([dx, dy]) => {
+        ctx.fillStyle = "#FF7A2B"; flameDrop(cx + dx + 4.5, cy + dy + 18, 9 + Math.sin(t * 30) * 2, 3, Math.PI / 2); ctx.fill();
+        ctx.beginPath(); ctx.roundRect(cx + dx, cy + dy, 9, 18, 4.5);
+        ctx.fillStyle = "#E5484D"; ctx.fill(); ctx.strokeStyle = INK; ctx.lineWidth = 2.2; ctx.stroke();
+      });
+    } else {
+      // a blue flame with three tongues
+      const fl = Math.sin(t * 20) * 2;
+      ctx.fillStyle = "#2E7BFF";
+      flameDrop(cx - 4, cy + 8, 17 - fl, 6, -Math.PI / 2 - 0.55); ctx.fill();
+      flameDrop(cx + 4, cy + 8, 17 + fl, 6, -Math.PI / 2 + 0.55); ctx.fill();
+      flameDrop(cx, cy + 8, 25 + fl, 8.5, -Math.PI / 2); ctx.fill();
+      ctx.fillStyle = "#9AD8FF"; flameDrop(cx, cy + 9, 14, 5, -Math.PI / 2); ctx.fill();
+    }
+    // sparkles circling it
+    ctx.fillStyle = "#fff";
+    for (let i = 0; i < 3; i++) {
+      const a = t * 3 + i * 2.1, r = 30;
+      const sx = cx + Math.cos(a) * r, sy = cy + Math.sin(a) * r * 0.8, k = 3 + Math.sin(t * 9 + i) * 1.5;
+      ctx.beginPath(); ctx.moveTo(sx, sy - k); ctx.lineTo(sx + k * 0.35, sy); ctx.lineTo(sx, sy + k); ctx.lineTo(sx - k * 0.35, sy); ctx.closePath(); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(sx - k, sy); ctx.lineTo(sx, sy + k * 0.35); ctx.lineTo(sx + k, sy); ctx.lineTo(sx, sy - k * 0.35); ctx.closePath(); ctx.fill();
+    }
+  }
+  function drawSpeedLines(t) {
+    if (boost < 1.15) return;
+    ctx.strokeStyle = `rgba(255,255,255,${Math.min(0.7, (boost - 1) * 0.6)})`;
+    ctx.lineWidth = 2.5; ctx.lineCap = "round";
+    for (let i = 0; i < 14; i++) {
+      const yy = 25 + hash(i + 1) * 215, len = 40 + hash(i + 50) * 70;
+      const xx = W + 100 - ((t * 1100 * (0.8 + hash(i + 9) * 0.6) + hash(i + 3) * (W + 200)) % (W + 300));
+      ctx.beginPath(); ctx.moveTo(xx, yy); ctx.lineTo(xx + len, yy); ctx.stroke();
+    }
+  }
+  function drawObstacle(o, t) {
+    if (o.smashed) {
+      const cx = o.x + o.w / 2, cy = GROUND - (o.lift || 0) - o.h / 2;
+      ctx.save(); ctx.translate(cx, cy - o.fly); ctx.rotate(o.rot); ctx.translate(-cx, -cy);
+    }
+    if (o.type === "rock") drawRock(o);
+    else if (o.type === "stump") drawStump(o);
+    else if (o.type === "fire") drawFire(o, t);
+    else if (o.type === "banana") drawBanana(o);
+    else drawBee(o, t);
+    if (o.smashed) ctx.restore();
+  }
+
+  // ---------- world ----------
+  function hash(n) { const s = Math.sin(n * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); }
+  function drawCloud(c) {
+    const x = c.x, y = c.y, s = c.s;
+    const puffs = [[0, 0, 18], [20, -8, 22], [42, 0, 17], [20, 6, 16]];
+    ctx.fillStyle = SHADE;
+    puffs.forEach(([px, py, r]) => { ell(x + px * s, y + py * s + 3, r * s, r * s); ctx.fill(); });
+    ctx.fillStyle = WHITE;
+    puffs.forEach(([px, py, r]) => { ell(x + px * s - 1, y + py * s, r * s, r * s * 0.92); ctx.fill(); });
+  }
+  function drawHills(par, base, amp, col, freq) {
+    const off = scroll * par;
+    ctx.fillStyle = col;
+    ctx.beginPath(); ctx.moveTo(0, GROUND);
+    for (let x = 0; x <= W; x += 10) {
+      const wx = x + off;
+      ctx.lineTo(x, base - (Math.sin(wx * freq) * 0.6 + Math.sin(wx * freq * 2.3 + 1.7) * 0.4 + 1) * amp);
+    }
+    ctx.lineTo(W, GROUND); ctx.closePath(); ctx.fill();
+  }
+  function drawGround() {
+    ctx.fillStyle = "#7CC576"; ctx.fillRect(0, GROUND, W, H - GROUND);
+    ctx.fillStyle = "#6AB565"; ctx.fillRect(0, GROUND + 22, W, H - GROUND - 22);
+    ctx.strokeStyle = INK; ctx.lineWidth = 3.5;
+    ctx.beginPath(); ctx.moveTo(0, GROUND); ctx.lineTo(W, GROUND); ctx.stroke();
+    const seg = 34, first = Math.floor(scroll / seg);
+    for (let k = first; k < first + W / seg + 2; k++) {
+      const h = hash(k), px = k * seg - scroll + h * 18;
+      const py = GROUND + 8 + Math.floor(hash(k + 99) * 3) * 13;
+      if (h < 0.45) {
+        ctx.strokeStyle = "#4E9A4B"; ctx.lineWidth = 2; ctx.lineCap = "round";
+        ctx.beginPath(); ctx.moveTo(px, py + 4); ctx.lineTo(px - 2, py); ctx.moveTo(px + 3, py + 4); ctx.lineTo(px + 4, py - 1); ctx.stroke();
+      } else if (h < 0.55) {
+        ctx.fillStyle = "#fff"; [[0, -2], [2.5, 0], [0, 2], [-2.5, 0]].forEach(([a, b]) => { ell(px + a, py + b, 2, 2); ctx.fill(); });
+        ctx.fillStyle = "#FFD54A"; ell(px, py, 1.6, 1.6); ctx.fill();
+      }
+    }
+  }
+
+  // ---------- render ----------
+  const pad = (n) => String(n).padStart(5, "0");
+  function render(t) {
+    const k = cv.width / W;
+    ctx.setTransform(k, 0, 0, k, 0, 0);
+    ctx.fillStyle = "#8FC5EA"; ctx.fillRect(0, 0, W, H);
+    ctx.save(); ctx.translate(0, camY);   // the camera rises with him on the jetpack
+    clouds.forEach(drawCloud);
+    drawHills(0.08, GROUND - 4, 34, "#B5E2B4", 0.006);
+    drawHills(0.22, GROUND, 20, "#9BD69A", 0.011);
+    drawGround();
+    for (const c of skyPuffs) if (c.back) drawCloud(c);   // big clouds behind him up high
+
+    if (boss) boss.kind === "rex" ? drawRex(boss, t) : drawGorilla(boss, t);
+    drawSpeedLines(t);
+    for (const p of pickups) drawPickup(p, t);
+    for (const o of obstacles) drawObstacle(o, t);
+
+    let mode = "run";
+    if (state === "ready") mode = "idle";
+    else if (state === "over") mode = "dead";
+    else if (m.power) mode = m.power.kind;
+    else if (m.falling) mode = "fall";
+    else if (!m.ground) mode = "jump";
+    const blink = m.grace > 0 && state === "play" && Math.floor(t * 14) % 2 === 0;
+    if (blink) ctx.globalAlpha = 0.35;
+    drawMooky(m.x, GROUND - m.y, mode, t);
+    ctx.globalAlpha = 1;
+
+    // a quick star-shaped "pow" where the super run smashes something
+    for (const b of bursts) {
+      const k = b.t / 0.35, r1 = 10 + k * 26, r2 = 4 + k * 12;
+      ctx.globalAlpha = 1 - k;
+      ctx.beginPath();
+      for (let i = 0; i < 16; i++) {
+        const a = i * Math.PI / 8 + 0.2, r = i % 2 ? r2 : r1;
+        ctx.lineTo(b.x + Math.cos(a) * r, b.y + Math.sin(a) * r);
+      }
+      ctx.closePath(); ctx.fillStyle = "#BFE6FF"; ctx.fill();
+      ctx.strokeStyle = INK; ctx.lineWidth = 2.5; ctx.lineJoin = "round"; ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // close-up clouds he flies through on the jetpack
+    for (const c of skyPuffs) {
+      if (c.back) continue;
+      ctx.fillStyle = "rgba(255,255,255,0.8)";
+      [[0, 0, 22], [24, -10, 28], [50, 0, 21], [24, 8, 20]].forEach(([px, py, r]) => { ell(c.x + px * c.s, c.y + py * c.s, r * c.s, r * c.s * 0.9); ctx.fill(); });
+    }
+
+    if (DEBUG && !params.has("noboxes")) {
+      ctx.strokeStyle = "red"; ctx.lineWidth = 1;
+      mookyBoxes().concat(...obstacles.map(obstacleBoxes)).forEach((b) => ctx.strokeRect(b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1));
+    }
+    ctx.restore();   // end of the camera view
+
+    // score
+    if (state !== "ready") {
+      const show = flashT <= 0 || Math.floor(flashT * 8) % 2 === 0;
+      ctx.font = `800 20px ui-rounded, "SF Pro Rounded", "Arial Rounded MT Bold", Nunito, system-ui, sans-serif`;
+      ctx.textAlign = "right"; ctx.textBaseline = "top";
+      ctx.fillStyle = "rgba(13,45,69,0.6)"; ctx.fillText(`HI ${pad(hi)}`, W - 110, 16);
+      if (show) { ctx.fillStyle = "#0d2d45"; ctx.fillText(pad(score), W - 18, 16); }
+    }
+
+    // overlays
+    if (state === "ready") {
+      outlinedText(`${TAP} to start`, W / 2, 125, 30);
+      if (hi > 0) outlinedText(`Best: ${hi}`, W / 2, 168, 18, "#FFE27A");
+    } else if (state === "over") {
+      outlinedText("OUCH!", W / 2, 100, 50);
+      outlinedText(newHi ? `New best: ${score}!` : `Score: ${score}`, W / 2, 148, 22, newHi ? "#FFE27A" : "#fff");
+      outlinedText(`${TAP} to try again`, W / 2, 184, 18);
+    } else if (state === "paused") {
+      outlinedText("PAUSED", W / 2, 110, 44);
+      outlinedText(`${TAP} to keep going`, W / 2, 158, 18);
+    }
+  }
+
+  // ---------- loop ----------
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+    update(dt);
+    render(now / 1000);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // ---------- test hooks (only with ?debug in the address) ----------
+  if (DEBUG) {
+    window.__mooky = {
+      m, update, render, start, jumpPress,
+      get boss() { return boss; }, get plan() { return plan; }, get pickups() { return pickups; },
+      get playTime() { return playTime; }, planPowerups,
+      forcePickup(kind) { pickups.push({ kind, x: m.x + 160, lift: 20 }); },
+      forceBoss(kind) { dist = Math.max(dist, 101 * 40); lastHundred = 1; newBoss(kind); },
+      get state() { return state; }, get score() { return score; },
+      get obstacles() { return obstacles; }, get speed() { return speed; },
+      boxes: () => ({ me: mookyBoxes(), obs: obstacles.map(obstacleBoxes) }),
+      poseSheet() {
+        const k = cv.width / W;
+        ctx.setTransform(k, 0, 0, k, 0, 0);
+        ctx.fillStyle = "#8FC5EA"; ctx.fillRect(0, 0, W, H);
+        ["run", "jump", "super", "jet", "dead"].forEach((mode, i) => {
+          ctx.save(); ctx.translate(80 + i * 160, 250); ctx.scale(2, 2); ctx.translate(-92, -GROUND);
+          m.phase = 1.1; drawMooky(92, GROUND, mode, 1.3); ctx.restore();
+          outlinedText(mode, 80 + i * 160, 280, 16);
+        });
+      }
+    };
+  }
+})();
+</script>
+</body>
+</html>
